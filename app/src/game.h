@@ -142,11 +142,13 @@ struct Tunables {
 
     // ---- throw
     float throwMinHandSpeed = 0.50f;          // ThrowHandler.MinSpeedThreshold = 50 cm/s
-    float throwVelocityWindow = 0.15f;        // ThrowHandler.AverageVelocityWindowSizeSeconds
-    // Launch speed
-    //   t = clamp((hand - minInputSpeed) / (maxInputSpeed - minInputSpeed), 0, 1)
-    //   speed = lerp(minProjectileThrownSpeed, maxProjectileThrownSpeed + strikes * SpeedIncreasePerStrike, t)
-    float minInputSpeed = 0.0f, maxInputSpeed = 6.50f;        // Brawl tuning 0 / 650 cm/s (C++ defaults 150 / 800)
+    float throwVelocityWindow = 0.12f;        // robust release estimate (100-150 ms is a useful tuning range)
+    float throwVelocityScale = 2.00f;         // ball m/s per measured hand m/s; direct, proportional transfer
+    float velocityNoiseTolerance = 0.04f;     // samples farther than this from the motion fit are down-weighted
+    float maxTrackedHandSpeed = 15.0f;        // rejects impossible tracking jumps without limiting ordinary throws
+    // Legacy recovered input range, retained for tuning-file/source compatibility. New throws use the direct scale
+    // above instead of remapping even small accepted hand speeds over the whole projectile-speed range.
+    float minInputSpeed = 0.0f, maxInputSpeed = 6.50f;
     float projectileMinSpeed = 0.0f, projectileMaxSpeed = 14.0f;
     float speedIncreasePerStrike = 0.5f;      // UProjectileSpeedParams.SpeedIncreasePerStrike 50 cm/s
     // STRIKE SPEED (0.3.19, a host's MATCH OPTION; owner 2026-11-11: regulation stays the default): 0 REGULATION (the
@@ -303,10 +305,14 @@ struct Tunables {
     Vec3 knuckleOffsetNow() const { return matchVersion >= kVerKnuckle ? knuckleOffset : knuckleOffsetOld; }
     Vec3 knuckleHalf = {0.064f, 0.048f, 0.029f};
     float knuckleRadius = 0.07f;                           // used for glow rendering only
-    // Deflections treat the guard / shield as a moving surface: v_out = reflect(v_in - v_hand) * restitution + v_hand,
-    // so a still fist returns the ball and a punch adds the fist's speed
+    // Shields use a moving-surface bounce. Slap shots use the same hand history but a separate finite-mass contact
+    // impulse, so a fast strike adds much more momentum than a gentle tap without a minimum kick.
     float deflectRestitution = 0.9f;
-    float handVelWindow = 0.045f;                          // short window for punch velocity
+    float handVelWindow = 0.045f;                          // low-latency slap/shield velocity window
+    float slapBallMass = 1.0f, slapEffectiveHandMass = 12.0f;
+    float slapRestitution = 0.75f, slapImpulseScale = 1.0f;
+    float slapFriction = 0.24f;                              // tangential momentum/spin transfer at a slap contact
+    float slapMinRelativeSpeed = 0.10f;                    // below this, contact transfers no noisy impulse
     float shieldAimAssistBasicDeg = 8.0f, shieldAimAssistAdvancedDeg = 2.0f;   // ShieldDeflectionAimAssistDegrees
     float knuckleAimAssistDeg = 8.0f;                      // BeginnerBrawl KnuckleGuardsAimAssistDegrees
     // strike zone a 70 cm ring 0.6 m behind the player, 1.28 m up, facing the court.
@@ -517,6 +523,9 @@ struct HandState {
     Pose gripHist[64];
     float histT[64];
     int histN = 0, histHead = 0;
+    // Developer/test instrumentation. These do not feed the simulation.
+    Vec3 lastReleaseVelocity, lastContactVelocity;
+    float lastContactImpulse = 0;
     bool shieldUp = false;
     bool knuckleUp = false;
     float prevTrigger = 0;
@@ -772,6 +781,8 @@ public:
 
     void startCountdown();   // round 1 of a new match: the 3-2-1
 private:
+    float slapShot(Ball& b, const Vec3& normal, const Vec3& handVelocity, int deflector, float assistDeg,
+                   const Vec3& from, float contactRadius);
     void stepMatch(float dt);
     void endRound(int winner);   // Advanced: a round won (by points, at time, or in sudden death)
     float lastFistLog = 0;

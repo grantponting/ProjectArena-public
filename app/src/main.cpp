@@ -4859,6 +4859,17 @@ static void handleEvents(App& a) {
         if (e.type != EventType::Bounce && e.type != EventType::Countdown)
             LOGI("event %s player %d hand %d value %.2f pos (%.2f %.2f %.2f) spin %.1f", eventName(e.type), e.player, e.hand, e.value,
                  e.pos.x, e.pos.y, e.pos.z, e.player >= 0 ? length(a.game.pl[e.player].ball.spin) : 0.f);
+        if (a.devMode && e.player >= 0 && e.player < a.game.np && e.hand >= 0 && e.hand < 2) {
+            const HandState& hs = a.game.pl[e.player].hands[e.hand];
+            if (e.type == EventType::Throw || e.type == EventType::ThrowFail)
+                LOGI("throw physics: hand %.2f m/s (%.2f %.2f %.2f), ball %.2f m/s, window %.0f ms",
+                     length(hs.lastReleaseVelocity), hs.lastReleaseVelocity.x, hs.lastReleaseVelocity.y,
+                     hs.lastReleaseVelocity.z, e.value, a.game.tun.throwVelocityWindow * 1000.f);
+            else if (e.type == EventType::KnuckleBlock)
+                LOGI("slap physics: hand %.2f m/s (%.2f %.2f %.2f), impulse %.2f kg-m/s, ball %.2f m/s, window %.0f ms",
+                     length(hs.lastContactVelocity), hs.lastContactVelocity.x, hs.lastContactVelocity.y,
+                     hs.lastContactVelocity.z, hs.lastContactImpulse, e.value, a.game.tun.handVelWindow * 1000.f);
+        }
         logHitTrail(a, e);
         switch (e.type) {
         // haptics: strong and long enough to feel through the Touch controllers' motors

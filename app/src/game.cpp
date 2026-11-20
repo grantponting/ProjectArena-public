@@ -20,20 +20,116 @@ Pose Game::knucklePose(int p, int h) const {
     const Pose& g = pl[p].in.hand[h].grip;
     return {g.q, g.transform(o)};
 }
-Vec3 Game::recentHandVel(int p, int h, const Vec3& local, float t) const {
-    // velocity of a grip-local point over a short window, from the recorded grip poses
-    const HandState& hs = pl[p].hands[h];
+static float median(float* a, int n) {
+    if (n <= 0) return 0.f;
+    std::sort(a, a + n);
+    return (n & 1) ? a[n / 2] : 0.5f * (a[n / 2 - 1] + a[n / 2]);
+}
+
+static Vec3 trackedPointVelocity(const HandState& hs, const Vec3& local, float window, float minSpan,
+                                 float noiseTolerance, float maxSpeed) {
+    // Robust line fit through timestamped poses. A median segment-velocity seed makes a one-frame tracking jump an
+    // outlier; a recency-weighted fit through the remaining samples preserves the direction at release. All weights
+    // are functions of time, not frame count, so the result is stable across refresh rates and uneven network input.
     if (hs.histN < 2) return {};
-    int newest = (hs.histHead + 63) & 63, oldest = newest;
-    (void)t;   // (counted back from the newest sample: HAND TIMES, see handVelocity)
-    for (int i = 1; i < hs.histN; ++i) {
-        int k = (newest - i + 64) & 63;
-        oldest = k;
-        if (hs.histT[newest] - hs.histT[k] >= tun.handVelWindow) break;
+    const int newest = (hs.histHead + 63) & 63;
+    int idx[64], n = 0;
+    for (int i = 0; i < hs.histN; ++i) {
+        const int k = (newest - i + 64) & 63;
+        idx[n++] = k;
+        if (hs.histT[newest] - hs.histT[k] >= window) break;
     }
-    float dt = hs.histT[newest] - hs.histT[oldest];
-    if (dt <= 1e-4f) return {};
-    return (hs.gripHist[newest].transform(local) - hs.gripHist[oldest].transform(local)) / dt;
+    if (n < 2 || hs.histT[newest] - hs.histT[idx[n - 1]] < minSpan) return {};
+
+    float sx[63], sy[63], sz[63];
+    Vec3 newestSegment{}, previousSegment{};
+    int ns = 0;
+    for (int i = 0; i + 1 < n; ++i) {
+        const int a = idx[i + 1], b = idx[i];
+        const float dt = hs.histT[b] - hs.histT[a];
+        if (dt < 0.004f) continue;
+        const Vec3 v = (hs.gripHist[b].transform(local) - hs.gripHist[a].transform(local)) / dt;
+        if (ns == 0) newestSegment = v;
+        else if (ns == 1) previousSegment = v;
+        sx[ns] = v.x; sy[ns] = v.y; sz[ns] = v.z; ++ns;
+    }
+    if (!ns) return {};
+    const Vec3 seed{median(sx, ns), median(sy, ns), median(sz, ns)};
+
+    // Find a robust line origin at the newest sample's time.
+    float ox[64], oy[64], oz[64];
+    for (int i = 0; i < n; ++i) {
+        const float t = hs.histT[idx[i]] - hs.histT[newest];
+        const Vec3 o = hs.gripHist[idx[i]].transform(local) - seed * t;
+        ox[i] = o.x; oy[i] = o.y; oz[i] = o.z;
+    }
+    const Vec3 origin{median(ox, n), median(oy, n), median(oz, n)};
+    const float newestSpeed = length(newestSegment), previousSpeed = length(previousSegment);
+    const bool recentCoherent = ns >= 2 && newestSpeed > 0.1f && previousSpeed > 0.1f &&
+                                dot(newestSegment / newestSpeed, previousSegment / previousSpeed) > 0.70f &&
+                                newestSpeed < previousSpeed * 2.5f && previousSpeed < newestSpeed * 2.5f;
+
+    float sw = 0, st = 0;
+    Vec3 sp{};
+    float weights[64] = {};
+    const float halfLife = std::max(0.01f, window * 0.5f);
+    for (int i = 0; i < n; ++i) {
+        const float t = hs.histT[idx[i]] - hs.histT[newest];
+        const Vec3 p = hs.gripHist[idx[i]].transform(local);
+        const float residual = length(p - (origin + seed * t));
+        const float robust = recentCoherent && i < 3 ? 1.f :
+                             residual <= noiseTolerance ? 1.f : noiseTolerance / std::max(residual, 1e-5f);
+        const float w = std::exp(t / halfLife) * robust * robust;
+        weights[i] = w; sw += w; st += w * t; sp += p * w;
+    }
+    if (sw <= 1e-5f) return {};
+    const float mt = st / sw;
+    const Vec3 mp = sp / sw;
+    float den = 0;
+    Vec3 num{};
+    for (int i = 0; i < n; ++i) {
+        const float t = hs.histT[idx[i]] - hs.histT[newest], d = t - mt;
+        const Vec3 p = hs.gripHist[idx[i]].transform(local);
+        den += weights[i] * d * d;
+        num += (p - mp) * (weights[i] * d);
+    }
+    Vec3 v = den > 1e-7f ? num / den : seed;
+    const float speed = length(v);
+    if (speed > maxSpeed) v *= maxSpeed / speed;
+    return v;
+}
+
+static Vec3 fastPointVelocity(const HandState& hs, const Vec3& local, float window, float maxSpeed) {
+    // Contact needs the newest real strike immediately. Average recent timestamped segment velocities with a short
+    // decay, then bias toward the newest segment. Unlike release velocity this intentionally accepts a one-frame
+    // acceleration; requiring an actual hand/ball overlap keeps it from launching a ball on its own.
+    if (hs.histN < 2) return {};
+    const int newest = (hs.histHead + 63) & 63;
+    Vec3 sum{};
+    float sw = 0;
+    Vec3 latest{};
+    bool haveLatest = false;
+    const float halfLife = std::max(0.006f, window * 0.25f);
+    for (int i = 0; i + 1 < hs.histN; ++i) {
+        const int b = (newest - i + 64) & 63, a = (b + 63) & 63;
+        const float age = hs.histT[newest] - hs.histT[b];
+        if (age > window) break;
+        const float dt = hs.histT[b] - hs.histT[a];
+        if (dt < 0.004f) continue;
+        Vec3 v = (hs.gripHist[b].transform(local) - hs.gripHist[a].transform(local)) / dt;
+        const float speed = length(v);
+        if (speed > maxSpeed) v *= maxSpeed / speed;
+        if (!haveLatest) { latest = v; haveLatest = true; }
+        const float w = std::exp(-age / halfLife) * dt;
+        sum += v * w; sw += w;
+    }
+    if (!haveLatest) return {};
+    return lerp(sw > 1e-6f ? sum / sw : latest, latest, 0.65f);
+}
+
+Vec3 Game::recentHandVel(int p, int h, const Vec3& local, float t) const {
+    (void)t;   // the newest headset timestamp is authoritative; see HAND TIMES in handVelocity
+    return fastPointVelocity(pl[p].hands[h], local, tun.handVelWindow, tun.maxTrackedHandSpeed);
 }
 bool Game::hitsBox(const Pose& box, const Vec3& half, const Vec3& from, const Vec3& to, float r, Vec3& n,
                    float* entry) const {
@@ -123,6 +219,56 @@ void Game::deflectMoving(Ball& b, const Vec3& n, const Vec3& vs, int deflector, 
     b.scored = false;
     b.timer = 0;   // (the self-hit grace, after a block as after a throw)
     b.progX = b.pos.x; b.progZ = b.pos.z; b.progT = 0;
+}
+
+float Game::slapShot(Ball& b, const Vec3& n, const Vec3& handVel, int deflector, float assistDeg,
+                     const Vec3& from, float contactRadius) {
+    // A slap is a collision with a finite effective hand mass, not a conventional release and not the shield's
+    // moving-wall reflection. J = -(1+e) v_relative.n / (1/m_ball + 1/m_hand). Working in velocity deltas keeps the
+    // rest of the projectile integrator unchanged; multiplying by ball mass below exposes the real impulse for debug.
+    const Vec3 before = b.vel;
+    const Vec3 relative = before - handVel;
+    const float vn = dot(relative, n);
+    Vec3 delta{};
+    if (vn < -tun.slapMinRelativeSpeed) {
+        const float ballMass = std::max(1e-3f, tun.slapBallMass);
+        const float handMass = std::max(1e-3f, tun.slapEffectiveHandMass);
+        const float massShare = handMass / (ballMass + handMass);
+        const float normalDelta = -(1.f + tun.slapRestitution) * vn * massShare * tun.slapImpulseScale;
+        delta = n * normalDelta;
+
+        if (contactRadius > 0.f) {
+            const Vec3 arm = -n * contactRadius;
+            const Vec3 slip = relative - n * vn + cross(b.spin, arm);
+            Vec3 tangentDelta = slip * (-2.f / 7.f * massShare * tun.slapImpulseScale);
+            const float tangent = length(tangentDelta), limit = tun.slapFriction * normalDelta;
+            if (tangent > limit) tangentDelta *= limit / tangent;
+            delta += tangentDelta;
+            b.spin += cross(arm, tangentDelta) * (2.5f / (contactRadius * contactRadius));
+            const float spin = length(b.spin);
+            if (spin > tun.maxSpin) b.spin *= tun.maxSpin / spin;
+        }
+    }
+
+    Vec3 out = before + delta;
+    const float cap = tun.projectileMaxSpeed + tun.perStrike() * strikesHeld(deflector);
+    float sp = length(out);
+    if (sp > cap) { out *= cap / sp; sp = cap; }
+    if (sp > 1e-4f && assistDeg > 0.f) {
+        Vec3 dir = out / sp, tgt = assistDir(deflector, from, dir);
+        const float ang = std::acos(clampf(dot(dir, tgt), -1.f, 1.f));
+        if (ang > 1e-4f) out = normalize(lerp(dir, tgt, std::min(1.f, deg2rad(assistDeg) / ang))) * sp;
+    }
+    b.vel = out;
+    b.speedLimit = sp;
+    b.instigator = deflector;
+    b.bankAimPending = false;
+    b.bankTurn = {};
+    b.rechargePending = false;
+    b.scored = false;
+    b.timer = 0;
+    b.progX = b.pos.x; b.progZ = b.pos.z; b.progT = 0;
+    return tun.slapBallMass * length(b.vel - before);
 }
 Pose Game::shieldLocal(int h) const {
     // Candidate placements (grip space: +X right, +Y up/thumb, -Z forward). side = +1 right hand, -1 left hand.
@@ -219,29 +365,18 @@ Vec3 Game::assistDir(int p, const Vec3& from, const Vec3& dir) const {
     return to;
 }
 float Game::throwSpeedFromHandSpeed(float s, int thrower) const {
-    // lerp(minThrown, maxThrown + strikes * SpeedIncreasePerStrike, t)
-    float t = clampf((s - tun.minInputSpeed) / std::max(1e-3f, tun.maxInputSpeed - tun.minInputSpeed), 0.f, 1.f);
-    int strikes = strikesHeld(thrower);
-    return lerpf(tun.projectileMinSpeed, tun.projectileMaxSpeed + strikes * tun.perStrike(), t);
+    // Direct momentum mapping: twice the hand speed gives twice the launch speed until the established projectile cap.
+    const float strikeBonus = strikesHeld(thrower) * tun.perStrike();
+    const float cap = tun.projectileMaxSpeed + strikeBonus;
+    return clampf(s * tun.throwVelocityScale + strikeBonus, tun.projectileMinSpeed, cap);
 }
 
 Vec3 Game::handVelocity(int p, int h, float t) const {
-    // Average velocity of the launcher point over ThrowHandler.AverageVelocityWindowSizeSeconds.
-    const HandState& hs = pl[p].hands[h];
-    if (hs.histN < 2) return {};
-    int newest = (hs.histHead + 63) & 63;
-    int oldest = newest;
-    for (int i = 1; i < hs.histN; ++i) {
-        int k = (newest - i + 64) & 63;
-        oldest = k;
-        // (counted back from the newest sample, not from `t`: a player's samples online are timed by their headset
-        // and run a fixed delay behind the host's clock, which cut the window short and made throws faster, owner's
-        // tests 2026-11-11; the same as before wherever the newest sample is now)
-        if (hs.histT[newest] - hs.histT[k] >= tun.throwVelocityWindow) break;
-    }
-    float dt = hs.histT[newest] - hs.histT[oldest];
-    if (dt <= 1e-4f) return {};
-    return (hs.hist[newest] - hs.hist[oldest]) / dt;
+    (void)t;
+    // Measure where the ball actually sits in the fist. The old launcher point was 25 cm forward, so a small wrist
+    // rotation could look like a fast translational throw even while the controller and held ball barely moved.
+    return trackedPointVelocity(pl[p].hands[h], tun.holdOffset, tun.throwVelocityWindow, 0.040f,
+                                tun.velocityNoiseTolerance, tun.maxTrackedHandSpeed);
 }
 
 const char* eventName(EventType t) {
@@ -746,7 +881,7 @@ void Game::stepBall(int p, float dt, int ignoredPlayer) {
         return;
     }
     case BallState::Held:
-        b.pos = pl[p].in.hand[b.heldHand].grip.transform(tun.holdOffset);   // in the fist (throws use the launcher)
+        b.pos = pl[p].in.hand[b.heldHand].grip.transform(tun.holdOffset);   // responsive 1:1 follow; release samples this point too
         return;
     case BallState::Returning:
     case BallState::Flying: break;
@@ -1193,7 +1328,12 @@ void Game::stepFire(int p, int k, float dt) {
                         Vec3 face = knucklePose(q, hh).q.rotate({0, 0, -1});
                         const Vec3 vs = recentHandVel(q, hh, lo, now);
                         if (dot(face, b.vel - vs) > 0) face = -face;
-                        deflectMoving(b, normalize(face * 0.75f + n * 0.25f), vs, q, tun.knuckleAimAssistDeg, from, true);
+                        const Vec3 relative = b.vel - vs;
+                        Vec3 contactN = normalize(n * 0.25f + face * 0.15f - normalize(relative) * 0.60f);
+                        if (dot(contactN, b.vel - vs) >= 0) contactN = n;
+                        HandState& hs = pl[q].hands[hh];
+                        hs.lastContactVelocity = vs;
+                        hs.lastContactImpulse = slapShot(b, contactN, vs, q, tun.knuckleAimAssistDeg, from, r);
                         emit(EventType::KnuckleBlock, q, hh, from, length(b.vel), p);
                         handled = true;
                     }
@@ -1371,6 +1511,7 @@ void Game::stepPlayer(int p, float dt) {
         if (!s.isBot && hi.tracked) {
             if (holding && released) {
                 Vec3 v = handVelocity(p, h, now);
+                hs.lastReleaseVelocity = v;
                 float sp = length(v);
                 // throws count in a match, and as warm-up while waiting for an opponent (scoring needs a match)
                 const bool canThrow = match == MatchState::InProgress || match == MatchState::WaitingForPlayers;
@@ -1547,6 +1688,7 @@ void Game::lookAhead(int L, float lead, float dt) {
         const Vec3 v = handVelocity(L, h, now);
         const float sp = length(v);
         if (hi.tracked && hi.trigger < 0.35f && sp >= tun.throwMinHandSpeed) {
+            me.hands[h].lastReleaseVelocity = v;
             const Ball keep = mb;
             const size_t ne = events.size();
             // (from where the host launches it: the ball in the fist, where the last step left it, not the
@@ -1686,8 +1828,13 @@ bool Game::tryBlock(Ball& b, int ball, int q, int hh, int pass, const Vec3& from
         // bounce off the guard's front face (fist forward), not whichever box face was entered first
         Vec3 face = guard.q.rotate({0, 0, -1});
         if (dot(face, b.vel - vs) > 0) face = -face;
-        n = normalize(face * 0.75f + n * 0.25f);
-        deflectMoving(b, n, vs, q, tun.knuckleAimAssistDeg, from, true, spinContact ? r : 0.f);
+        const Vec3 relative = b.vel - vs;
+        Vec3 contactN = normalize(n * 0.25f + face * 0.15f - normalize(relative) * 0.60f);
+        if (dot(contactN, b.vel - vs) >= 0) contactN = n;
+        HandState& hs = pl[q].hands[hh];
+        hs.lastContactVelocity = vs;
+        hs.lastContactImpulse = slapShot(b, contactN, vs, q, tun.knuckleAimAssistDeg, from,
+                                         spinContact ? r : 0.f);
         emit(EventType::KnuckleBlock, q, hh, from, length(b.vel), ball);
         return true;
     }
@@ -1718,7 +1865,7 @@ void Game::recordHand(int p, int h) {
         t = pl[p].in.sampleT;
         if (hs.histN && t <= hs.histT[(hs.histHead + 63) & 63] + 1e-5f) return;
     }
-    hs.hist[hs.histHead] = launcherPoint(p, h);
+    hs.hist[hs.histHead] = hi.grip.transform(tun.holdOffset);
     hs.angHist[hs.histHead] = hi.angVel;
     hs.gripHist[hs.histHead] = hi.grip;
     hs.histT[hs.histHead] = t;
